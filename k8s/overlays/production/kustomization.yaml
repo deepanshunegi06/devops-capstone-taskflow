@@ -1,0 +1,15 @@
+# Promotion: stable scaled to 5 replicas. The canary Deployment is deleted explicitly
+# by CI (kubectl apply does not prune), see .github/workflows/ci-cd.yml.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: taskflow
+resources:
+  - ../../base
+patches:
+  - target:
+      kind: Deployment
+      name: taskflow-api
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 5

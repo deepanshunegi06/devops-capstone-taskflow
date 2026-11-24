@@ -1,0 +1,7 @@
+http_requests_total{method="GET",route="/health/live",status="200"} 1
+http_requests_total{method="GET",route="/health/ready",status="200"} 1
+http_requests_total{method="GET",route="/api/tasks",status="200"} 1
+http_requests_total{method="GET",route="/metrics",status="200"} 1
+http_requests_total{method="POST",route="/api/tasks",status="201"} 1
+http_requests_total{method="DELETE",route="/api/tasks/:id",status="204"} 1
+taskflow_tasks_total 3

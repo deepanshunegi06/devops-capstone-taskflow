@@ -1,0 +1,30 @@
+groups:
+  - name: taskflow-api-slo
+    rules:
+      - alert: TaskflowHighErrorRate
+        expr: sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.01
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "5xx error ratio above 1% for 5 minutes (SLO breach)"
+
+      - alert: TaskflowHighLatencyP95
+        expr: histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m]))) > 0.5
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "p95 latency above 500ms"
+
+      - alert: TaskflowTargetDown
+        expr: up{job="taskflow-api"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "taskflow-api instance is down"
+
+      - alert: TaskflowCanaryErrors
+        expr: sum(rate(http_requests_total{track="canary",status=~"5.."}[5m])) > 0.05
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Canary is returning 5xx - roll back"

@@ -1,0 +1,19 @@
+{
+  "name": "taskflow-api",
+  "version": "1.0.0",
+  "description": "Sample application for the DevOps automation capstone (Deepanshu Negi, 2301350026)",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/",
+    "lint": "node --check src/server.js && node --check src/app.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "prom-client": "^15.1.3"
+  }
+}

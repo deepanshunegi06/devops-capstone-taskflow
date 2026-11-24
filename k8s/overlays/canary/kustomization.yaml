@@ -1,0 +1,8 @@
+# Canary overlay: a second Deployment (track=canary) behind the same Service.
+# With 1 canary pod and 9 stable pods, roughly 10% of traffic reaches the canary.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: taskflow
+resources:
+  - ../../base
+  - canary-deployment.yaml

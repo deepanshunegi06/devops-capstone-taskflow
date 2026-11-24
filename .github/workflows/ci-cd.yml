@@ -1,0 +1,179 @@
+# CI/CD pipeline: commit -> test -> scan -> build -> push -> deploy (staging) -> canary -> production.
+name: ci-cd
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/taskflow-api
+
+jobs:
+  test:
+    name: Lint and unit tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+
+  secrets-scan:
+    name: Secret scanning (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    name: Build, scan and push image
+    needs: [test, secrets-scan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,format=long
+            type=semver,pattern={{version}}
+            type=ref,event=branch
+      - name: Build (local, for scanning)
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          load: true
+          tags: taskflow-api:scan
+      - name: Vulnerability scan (Trivy) - fail on HIGH/CRITICAL
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: taskflow-api:scan
+          format: sarif
+          output: trivy.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Upload SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: taskflow-api:scan
+          format: spdx-json
+          output-file: sbom.spdx.json
+      - name: Push image
+        id: push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: true
+          sbom: true
+      - name: Sign image (keyless cosign)
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@v3
+      - if: github.event_name != 'pull_request'
+        run: cosign sign --yes "${IMAGE}@${{ steps.push.outputs.digest }}"
+
+  deploy-staging:
+    name: Deploy to staging
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > ~/.kube/config
+      - name: Apply staging overlay and pin image to the built digest
+        run: |
+          kubectl apply -k k8s/overlays/staging
+          kubectl -n taskflow set image deploy/taskflow-api api="${IMAGE}@${{ needs.build.outputs.digest }}"
+      - name: Wait for rollout and smoke test
+        run: |
+          kubectl -n taskflow rollout status deploy/taskflow-api --timeout=180s
+          kubectl -n taskflow run smoke --rm -i --restart=Never --image=curlimages/curl:8.10.1 -- \
+            curl -fsS http://taskflow-api/health/ready
+
+  deploy-production:
+    name: Canary, verify, promote
+    needs: [build, deploy-staging]
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: production   # manual approval configured in GitHub environment settings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_PROD }}" | base64 -d > ~/.kube/config
+      - name: Deploy canary (1 pod, ~10% of traffic) with the new digest
+        run: |
+          kubectl apply -k k8s/overlays/canary
+          kubectl -n taskflow set image deploy/taskflow-api-canary api="${IMAGE}@${{ needs.build.outputs.digest }}"
+          kubectl -n taskflow rollout status deploy/taskflow-api-canary --timeout=180s
+      - name: Observe canary for 5 minutes, then gate on 5xx rate
+        run: |
+          sleep 300
+          # Prometheus lives in the monitoring namespace; query it through the service proxy.
+          RESP=$(kubectl -n monitoring get --raw \
+            "/api/v1/namespaces/monitoring/services/prometheus:9090/proxy/api/v1/query?query=sum(rate(http_requests_total%7Btrack%3D%22canary%22%2Cstatus%3D~%225..%22%7D%5B5m%5D))")
+          RATE=$(echo "$RESP" | python3 -c 'import json,sys; r=json.load(sys.stdin)["data"]["result"]; print(r[0]["value"][1] if r else "0")')
+          echo "canary 5xx rate (req/s): ${RATE}"
+          if python3 -c "import sys; sys.exit(0 if float('${RATE}') > 0.05 else 1)"; then
+            echo "Canary unhealthy - rolling back"
+            kubectl -n taskflow delete deploy/taskflow-api-canary
+            exit 1
+          fi
+      - name: Promote to stable and remove canary
+        run: |
+          kubectl -n taskflow set image deploy/taskflow-api api="${IMAGE}@${{ needs.build.outputs.digest }}"
+          kubectl apply -k k8s/overlays/production
+          kubectl -n taskflow delete deploy/taskflow-api-canary --ignore-not-found
+          kubectl -n taskflow rollout status deploy/taskflow-api --timeout=300s

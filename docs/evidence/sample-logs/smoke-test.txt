@@ -1,0 +1,6 @@
+PASS /health/live -> 200
+PASS /health/ready -> 200
+PASS /api/tasks -> 200
+PASS /metrics -> 200
+DELETE -> 204
+Smoke test complete
